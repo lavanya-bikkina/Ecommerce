@@ -1,0 +1,129 @@
+file_path='path to your dataset'
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
+#!pip install scikit-surprise
+from surprise import Dataset, Reader, SVD
+from surprise.model_selection import GridSearchCV, cross_validate
+
+
+
+
+# Step 1: Load and Clean Data
+def load_data(file_path):
+    data = pd.read_csv(file_path)
+    data['Description'].fillna('No Description', inplace=True)
+    data['InvoiceDate'] = pd.to_datetime(data['InvoiceDate'], errors='coerce')
+    data.drop_duplicates(inplace=True)
+    data = data[data['CustomerID'].notna()]
+    return data
+
+# Step 2: Feature Engineering
+def feature_engineering(data):
+    data['Year'] = data['InvoiceDate'].dt.year.fillna(2024).astype(int)
+    data['Month'] = data['InvoiceDate'].dt.month.fillna(9).astype(int)
+    data['Day'] = data['InvoiceDate'].dt.day.fillna(9).astype(int)
+    data['Hour'] = data['InvoiceDate'].dt.hour.fillna(9).astype(int)
+    data['Revenue'] = data['Quantity'] * data['UnitPrice']
+    return data
+
+# Step 3: Outlier Removal
+def remove_outliers(data):
+    def find_outliers(column):
+        Q1 = column.quantile(0.25)
+        Q3 = column.quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        return column[(column < lower_bound) | (column > upper_bound)]
+
+    quantity_outliers = find_outliers(data['Quantity'])
+    unitprice_outliers = find_outliers(data['UnitPrice'])
+    data = data[~data['Quantity'].isin(quantity_outliers)]
+    data = data[~data['UnitPrice'].isin(unitprice_outliers)]
+    data = data[(data['UnitPrice'] >= 0) & (data['Quantity'] >= 1)]
+    return data
+
+# Step 4: Create Interaction Matrices
+def create_interaction_matrices(data):
+    uk_interaction_matrix = uk_data.pivot_table(index='CustomerID', columns='StockCode', values='Quantity', fill_value=0)
+    non_uk_interaction_matrix = non_uk_data.pivot_table(index='CustomerID', columns='StockCode', values='Quantity', fill_value=0)
+
+    return uk_interaction_matrix, non_uk_interaction_matrix
+
+# Step 5: Apply SVD and Calculate Similarity
+def apply_svd_and_similarity(interaction_matrix, n_components=50):
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    matrix_reduced = svd.fit_transform(interaction_matrix)
+    similarity_matrix = cosine_similarity(matrix_reduced)
+    return svd, similarity_matrix
+
+# Step 6: Train the Model using Surprise
+def train_surprise_model(data, param_grid):
+    reader = Reader(rating_scale=(0, 1))
+    data = Dataset.load_from_df(data[['CustomerID', 'StockCode', 'Quantity']], reader)
+    grid_search = GridSearchCV(SVD, param_grid, measures=['rmse'], cv=3)
+    grid_search.fit(data)
+    best_model = grid_search.best_estimator['rmse']
+    return best_model
+
+# Step 7: Make Recommendations
+def recommend_products(customer_id, country, uk_model, non_uk_model, uk_interaction_matrix, non_uk_interaction_matrix, uk_similarity_matrix, non_uk_similarity_matrix, top_n=5):
+    if country == 'United Kingdom':
+        interaction_matrix = uk_interaction_matrix
+        model = uk_model
+        similarity_matrix = uk_similarity_matrix
+    else:
+        interaction_matrix = non_uk_interaction_matrix
+        model = non_uk_model
+        similarity_matrix = non_uk_similarity_matrix
+
+    customer_idx = interaction_matrix.index.get_loc(customer_id)
+    similar_customers = similarity_matrix[customer_idx]
+    similar_customers_idx = similar_customers.argsort()[::-1]
+
+    similar_customer_products = []
+    for idx in similar_customers_idx:
+        similar_customer_id = interaction_matrix.index[idx]
+        similar_customer_products.extend(data[data['CustomerID'] == similar_customer_id]['StockCode'].unique())
+
+    customer_purchased_products = set(data[data['CustomerID'] == customer_id]['StockCode'].unique())
+    recommended_products = [prod for prod in similar_customer_products if prod not in customer_purchased_products]
+    product_counts = pd.Series(recommended_products).value_counts()
+
+    recommendations = product_counts.to_frame(name='Count').reset_index()
+    recommendations.columns = ['StockCode', 'Count']
+
+    # Merge with product descriptions
+    recommendations_with_descriptions = recommendations.merge(data[['StockCode', 'Description']].drop_duplicates(), on='StockCode', how='left')
+
+    return recommendations_with_descriptions[['StockCode', 'Description', 'Count']].head(top_n)
+
+# Main Execution
+file_path = 'Online_Retail_Data_Set.csv'
+data = load_data(file_path)
+data = feature_engineering(data)
+data = remove_outliers(data)
+uk_data = data[data['Country'] == 'United Kingdom']
+non_uk_data = data[data['Country'] != 'United Kingdom']
+uk_interaction_matrix, non_uk_interaction_matrix = create_interaction_matrices(data)
+svd_uk, uk_similarity_matrix = apply_svd_and_similarity(uk_interaction_matrix)
+svd_non_uk, non_uk_similarity_matrix = apply_svd_and_similarity(non_uk_interaction_matrix)
+
+param_grid = {'n_factors': [50, 100, 150], 'reg_all': [0.1, 0.2, 0.3], 'n_epochs': [20, 40, 60]}
+uk_model = train_surprise_model(uk_data, param_grid)
+non_uk_model = train_surprise_model(non_uk_data, param_grid)
+
+customer_id = int(input("Enter your Customer_ID:"))
+country = input("Enter your country:")
+
+if customer_id in data['CustomerID'].values:
+    recommended_products = recommend_products(customer_id, country, uk_model, non_uk_model, uk_interaction_matrix, non_uk_interaction_matrix, uk_similarity_matrix, non_uk_similarity_matrix, top_n=5)
+    print(f"Recommended products for customer {customer_id}:")
+    print(recommended_products)
+else:
+    print("Invalid CustomerID")
